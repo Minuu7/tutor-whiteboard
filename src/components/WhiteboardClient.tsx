@@ -10,8 +10,6 @@ import {
   TLShapeId,
   Tldraw,
   createShapeId,
-  getSnapshot,
-  loadSnapshot,
 } from 'tldraw';
 import * as pdfjsLib from 'pdfjs-dist';
 import type { RealtimeChannel } from '@supabase/supabase-js';
@@ -59,13 +57,29 @@ function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   );
 }
 
+// Never let Tldraw hide an internal crash behind a blank screen
+const tldrawComponents = {
+  ErrorFallback: ({ error }: { error: unknown }) => (
+    <div style={{ padding: 24, color: 'red', background: '#fff', zIndex: 99999, position: 'relative', overflow: 'auto', height: '100%' }}>
+      <h3>Tldraw Internal Crash:</h3>
+      <pre style={{ whiteSpace: 'pre-wrap' }}>
+        {String((error as Error | undefined)?.stack || error)}
+      </pre>
+    </div>
+  ),
+};
+
+function isValidSnapshot(s: unknown): s is { store: Record<string, unknown>; schema: unknown } {
+  return !!s && typeof s === 'object' && 'store' in s && 'schema' in s;
+}
+
 // Isolate <Tldraw /> inside React.memo so parent state changes NEVER touch it
 const MemoizedTldraw = React.memo(function MemoizedTldraw({
   onMount,
 }: {
   onMount: (editor: Editor) => void;
 }) {
-  return <Tldraw onMount={onMount} />;
+  return <Tldraw onMount={onMount} components={tldrawComponents} />;
 });
 
 export default function WhiteboardClient({ roomId }: { roomId: string }) {
@@ -138,7 +152,7 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
       updateStatusBadge('Saving...');
 
       try {
-        const snapshot = getSnapshot(ed.store);
+        const snapshot = ed.store.getSnapshot();
         const { error } = await supabase.from('whiteboard_sessions').upsert(
           {
             room_id: roomId,
@@ -182,15 +196,23 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
     (ed: Editor) => {
       editorRef.current = ed;
 
-      if (initialSnapshotRef.current) {
+      const initialSnapshot = initialSnapshotRef.current;
+      if (isValidSnapshot(initialSnapshot)) {
+        const backup = ed.store.getSnapshot();
         try {
-          loadSnapshot(
-            ed.store,
-            initialSnapshotRef.current as Parameters<typeof loadSnapshot>[1]
+          ed.store.loadSnapshot(
+            initialSnapshot as unknown as Parameters<typeof ed.store.loadSnapshot>[0]
           );
         } catch (e) {
           console.error('Snapshot load failed (starting fresh):', e);
+          try {
+            ed.store.loadSnapshot(backup);
+          } catch {
+            /* ignore */
+          }
         }
+      } else if (initialSnapshot) {
+        console.warn('Ignoring incompatible canvas snapshot; starting with a clean board.');
       }
       updateStatusBadge('Synced ✓');
 
@@ -216,17 +238,21 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
 
       const unlisten = ed.store.listen(
         ({ changes }) => {
-          try {
-            const payload: CanvasChangesPayload = {
-              added: Object.values(changes.added),
-              updated: Object.values(changes.updated).map(([, to]) => to),
-              removed: Object.keys(changes.removed) as TLRecord['id'][],
-            };
-            void channel.send({ type: 'broadcast', event: 'canvas-changes', payload });
-            scheduleSave(ed);
-          } catch (err) {
-            console.error('Listen broadcast error:', err);
-          }
+          // Snapshot the diff synchronously (cheap), but run ALL side effects
+          // outside Tldraw's reactive transaction.
+          const payload: CanvasChangesPayload = {
+            added: Object.values(changes.added),
+            updated: Object.values(changes.updated).map(([, to]) => to),
+            removed: Object.keys(changes.removed) as TLRecord['id'][],
+          };
+          setTimeout(() => {
+            try {
+              void channel.send({ type: 'broadcast', event: 'canvas-changes', payload });
+              scheduleSave(ed);
+            } catch (err) {
+              console.error('Listen broadcast error:', err);
+            }
+          }, 0);
         },
         { source: 'user', scope: 'document' }
       );
@@ -293,7 +319,7 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
 
         setUploadMsg('Placing pages…');
         let firstShape: TLShapeId | null = null;
-        ed.run(() => {
+        ed.batch(() => {
           const bounds = ed.getCurrentPageBounds();
           const x = bounds ? bounds.minX : 0;
           let y = bounds ? bounds.maxY + SOLVING_SPACE : 0;
@@ -354,7 +380,7 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
     const h = 500;
     const vp = ed.getViewportPageBounds();
     const assetId: TLAssetId = AssetRecordType.createId();
-    ed.run(() => {
+    ed.batch(() => {
       ed.createAssets([
         {
           id: assetId,

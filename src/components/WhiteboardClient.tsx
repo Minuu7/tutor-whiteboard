@@ -1,7 +1,7 @@
 'use client';
 
 import 'tldraw/tldraw.css';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AssetRecordType,
   Editor,
@@ -41,10 +41,10 @@ interface CanvasChangesPayload {
 }
 
 const SOLVING_SPACE = 600;
-const SAVE_DEBOUNCE_MS = 1200;
+const SAVE_DEBOUNCE_MS = 1500;
 const BUCKET = 'worksheets';
 
-/** Tiny (~1KB) SVG — safe to keep inline in the snapshot. */
+/** Fixed SVG syntax for the Solution Space box */
 function buildGridBoxSvg(w: number, h: number): string {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
 <defs><pattern id="g" width="24" height="24" patternUnits="userSpaceOnUse"><path d="M 24 0 L 0 0 0 24" fill="none" stroke="#e2e8f0" stroke-width="1"/></pattern></defs>
@@ -60,12 +60,46 @@ function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   );
 }
 
+/** Error Boundary so Tldraw never vanishes silently into a black screen */
+class CanvasErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: Error | null }
+> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex h-full w-full flex-col items-center justify-center bg-slate-900 p-6 text-white">
+          <h2 className="text-lg font-bold text-rose-400">Whiteboard Render Error</h2>
+          <pre className="mt-2 max-w-xl overflow-auto rounded bg-black/50 p-4 text-xs text-slate-300">
+            {this.state.error.message}
+          </pre>
+          <button
+            onClick={() => this.setState({ error: null })}
+            className="mt-4 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-400"
+          >
+            Reload Whiteboard
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function WhiteboardClient({ roomId }: { roomId: string }) {
   const [gate, setGate] = useState<Gate>('checking');
   const [accessKey, setAccessKey] = useState('');
   const [initialSnapshot, setInitialSnapshot] = useState<unknown>(null);
 
-  const [editor, setEditor] = useState<Editor | null>(null);
+  const editorRef = useRef<Editor | null>(null);
+  const [editorReady, setEditorReady] = useState(false);
   const [status, setStatus] = useState<SyncStatus>('Loading...');
   const [uploading, setUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState('');
@@ -76,6 +110,7 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
   const savingRef = useRef(false);
   const dirtyRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mountedRef = useRef(false);
 
   // ---------- 1. Invite-key gate ----------
   useEffect(() => {
@@ -105,29 +140,39 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
         saveTimerRef.current = null;
       }
       if (savingRef.current) {
-        dirtyRef.current = true; // save again once the in-flight save finishes
+        dirtyRef.current = true;
         return;
       }
       savingRef.current = true;
       dirtyRef.current = false;
-      setStatus('Saving...');
-      const snapshot = getSnapshot(ed.store);
-      const { error } = await supabase.from('whiteboard_sessions').upsert({
-        room_id: roomId,
-        access_token: accessKey,
-        canvas_snapshot: snapshot,
-        updated_at: new Date().toISOString(),
-      });
-      savingRef.current = false;
-      if (error) {
-        console.error('Autosave failed:', error);
+      setStatus((prev) => (prev === 'Saving...' ? prev : 'Saving...'));
+
+      try {
+        const snapshot = getSnapshot(ed.store);
+        const { error } = await supabase.from('whiteboard_sessions').upsert(
+          {
+            room_id: roomId,
+            access_token: accessKey,
+            canvas_snapshot: snapshot,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'room_id' }
+        );
+        savingRef.current = false;
+        if (error) {
+          console.error('Autosave failed:', error);
+          setStatus('Save failed');
+          return;
+        }
+        if (dirtyRef.current) {
+          void saveNow(ed);
+        } else {
+          setStatus('Synced ✓');
+        }
+      } catch (err) {
+        savingRef.current = false;
+        console.error('Autosave exception:', err);
         setStatus('Save failed');
-        return;
-      }
-      if (dirtyRef.current) {
-        void saveNow(ed);
-      } else {
-        setStatus('Synced ✓');
       }
     },
     [roomId, accessKey]
@@ -135,7 +180,8 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
 
   const scheduleSave = useCallback(
     (ed: Editor) => {
-      setStatus('Saving...');
+      // Prevent 60fps React re-renders while drawing a stroke
+      setStatus((prev) => (prev === 'Saving...' ? prev : 'Saving...'));
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
       saveTimerRef.current = setTimeout(() => void saveNow(ed), SAVE_DEBOUNCE_MS);
     },
@@ -145,13 +191,17 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
   // ---------- 3. Mount: resume + realtime ----------
   const handleMount = useCallback(
     (ed: Editor) => {
-      setEditor(ed);
+      editorRef.current = ed;
+      setEditorReady(true);
+
+      if (mountedRef.current) return;
+      mountedRef.current = true;
 
       if (initialSnapshot) {
         try {
           loadSnapshot(ed.store, initialSnapshot as Parameters<typeof loadSnapshot>[1]);
         } catch (e) {
-          console.error('Snapshot load failed:', e);
+          console.error('Snapshot load failed (starting fresh):', e);
         }
       }
       setStatus('Synced ✓');
@@ -161,33 +211,42 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
       });
       channel
         .on('broadcast', { event: 'canvas-changes' }, ({ payload }) => {
-          const { added, updated, removed } = payload as CanvasChangesPayload;
-          ed.store.mergeRemoteChanges(() => {
-            const toPut = [...(added ?? []), ...(updated ?? [])];
-            if (toPut.length) ed.store.put(toPut);
-            const toRemove = (removed ?? []).filter((id) => ed.store.has(id));
-            if (toRemove.length) ed.store.remove(toRemove);
-          });
+          try {
+            const { added, updated, removed } = payload as CanvasChangesPayload;
+            ed.store.mergeRemoteChanges(() => {
+              const toPut = [...(added ?? []), ...(updated ?? [])];
+              if (toPut.length) ed.store.put(toPut);
+              const toRemove = (removed ?? []).filter((id) => ed.store.has(id));
+              if (toRemove.length) ed.store.remove(toRemove);
+            });
+          } catch (err) {
+            console.error('Remote merge error:', err);
+          }
         })
         .subscribe();
       channelRef.current = channel;
 
       const unlisten = ed.store.listen(
         ({ changes }) => {
-          const payload: CanvasChangesPayload = {
-            added: Object.values(changes.added),
-            updated: Object.values(changes.updated).map(([, to]) => to),
-            removed: Object.keys(changes.removed) as TLRecord['id'][],
-          };
-          void channel.send({ type: 'broadcast', event: 'canvas-changes', payload });
-          scheduleSave(ed);
+          try {
+            const payload: CanvasChangesPayload = {
+              added: Object.values(changes.added),
+              updated: Object.values(changes.updated).map(([, to]) => to),
+              removed: Object.keys(changes.removed) as TLRecord['id'][],
+            };
+            void channel.send({ type: 'broadcast', event: 'canvas-changes', payload });
+            scheduleSave(ed);
+          } catch (err) {
+            console.error('Listen broadcast error:', err);
+          }
         },
         { source: 'user', scope: 'document' }
       );
 
       return () => {
+        mountedRef.current = false;
         unlisten();
-        if (saveTimerRef.current) void saveNow(ed); // flush pending work
+        if (saveTimerRef.current) void saveNow(ed);
         void supabase.removeChannel(channel);
         channelRef.current = null;
       };
@@ -195,21 +254,13 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
     [initialSnapshot, roomId, scheduleSave, saveNow]
   );
 
-  // Warn before closing with unsaved work
-  useEffect(() => {
-    const onBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (saveTimerRef.current || savingRef.current) e.preventDefault();
-    };
-    window.addEventListener('beforeunload', onBeforeUnload);
-    return () => window.removeEventListener('beforeunload', onBeforeUnload);
-  }, []);
-
   // ---------- 4. PDF upload → Supabase Storage ----------
   const handlePdfUpload = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       e.target.value = '';
-      if (!file || !editor) return;
+      const ed = editorRef.current;
+      if (!file || !ed) return;
       if (file.type !== 'application/pdf') {
         alert('Please choose a PDF file.');
         return;
@@ -250,13 +301,13 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
 
         setUploadMsg('Placing pages…');
         let firstShape: TLShapeId | null = null;
-        editor.run(() => {
-          const bounds = editor.getCurrentPageBounds();
+        ed.run(() => {
+          const bounds = ed.getCurrentPageBounds();
           const x = bounds ? bounds.minX : 0;
           let y = bounds ? bounds.maxY + SOLVING_SPACE : 0;
           for (const p of placed) {
             const assetId: TLAssetId = AssetRecordType.createId();
-            editor.createAssets([
+            ed.createAssets([
               {
                 id: assetId,
                 typeName: 'asset',
@@ -266,18 +317,18 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
               },
             ]);
             const shapeId = createShapeId();
-            editor.createShape({ id: shapeId, type: 'image', x, y, isLocked: true, props: { assetId, w: p.w, h: p.h } });
-            editor.sendToBack([shapeId]);
+            ed.createShape({ id: shapeId, type: 'image', x, y, isLocked: true, props: { assetId, w: p.w, h: p.h } });
+            ed.sendToBack([shapeId]);
             if (!firstShape) firstShape = shapeId;
-            y += p.h + SOLVING_SPACE; // blank solving space under each page
+            y += p.h + SOLVING_SPACE;
           }
         });
 
         if (firstShape) {
-          const b = editor.getShapePageBounds(firstShape);
-          if (b) editor.zoomToBounds(b, { inset: 48, animation: { duration: 400 } });
+          const b = ed.getShapePageBounds(firstShape);
+          if (b) ed.zoomToBounds(b, { inset: 48, animation: { duration: 400 } });
         }
-        await saveNow(editor);
+        await saveNow(ed);
       } catch (err) {
         console.error(err);
         alert(`PDF upload failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -286,18 +337,19 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
         setUploadMsg('');
       }
     },
-    [editor, roomId, saveNow]
+    [roomId, saveNow]
   );
 
   // ---------- Tools ----------
   const addSolutionSpace = useCallback(() => {
-    if (!editor) return;
+    const ed = editorRef.current;
+    if (!ed) return;
     const w = 760;
     const h = 500;
-    const vp = editor.getViewportPageBounds();
+    const vp = ed.getViewportPageBounds();
     const assetId: TLAssetId = AssetRecordType.createId();
-    editor.run(() => {
-      editor.createAssets([
+    ed.run(() => {
+      ed.createAssets([
         {
           id: assetId,
           typeName: 'asset',
@@ -307,29 +359,30 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
         },
       ]);
       const shapeId = createShapeId();
-      editor.createShape({
+      ed.createShape({
         id: shapeId,
         type: 'image',
         x: vp.center.x - w / 2,
-        y: vp.maxY + 40, // just below the current view
+        y: vp.maxY + 40,
         isLocked: true,
         props: { assetId, w, h },
       });
-      editor.sendToBack([shapeId]);
+      ed.sendToBack([shapeId]);
     });
-    editor.centerOnPoint({ x: vp.center.x, y: vp.maxY + 40 + h / 2 }, { animation: { duration: 400 } });
-    editor.setCurrentTool('draw');
-  }, [editor]);
+    ed.centerOnPoint({ x: vp.center.x, y: vp.maxY + 40 + h / 2 }, { animation: { duration: 400 } });
+    ed.setCurrentTool('draw');
+  }, []);
 
   const clearDrawings = useCallback(() => {
-    if (!editor) return;
+    const ed = editorRef.current;
+    if (!ed) return;
     if (!confirm('Erase all pen strokes and notes on this page? The PDF worksheet stays.')) return;
-    const ids = editor
+    const ids = ed
       .getCurrentPageShapes()
       .filter((s) => !(s.type === 'image' && s.isLocked))
       .map((s) => s.id);
-    if (ids.length) editor.deleteShapes(ids);
-  }, [editor]);
+    if (ids.length) ed.deleteShapes(ids);
+  }, []);
 
   const copyInvite = useCallback(async () => {
     const url = `${window.location.origin}/room/${encodeURIComponent(roomId)}?key=${encodeURIComponent(accessKey)}`;
@@ -381,7 +434,7 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
     'inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-all duration-150 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed';
 
   return (
-    <div className="flex flex-col bg-slate-950" style={{ width: '100vw', height: '100vh' }}>
+    <div className="flex flex-col bg-slate-950" style={{ width: '100vw', height: '100vh', overflow: 'hidden' }}>
       <header className="z-10 flex flex-wrap items-center gap-2 border-b border-white/10 bg-gradient-to-r from-slate-950 via-indigo-950/80 to-slate-950 px-3 py-2 shadow-lg shadow-black/40">
         <a href="/" id="home-link" className={`${btn} text-slate-300 hover:bg-white/10`} title="Home">
           <Home size={16} />
@@ -399,25 +452,25 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
         <input ref={fileInputRef} id="pdf-input" type="file" accept="application/pdf" className="hidden" onChange={handlePdfUpload} />
         <button
           id="upload-pdf-btn"
-          disabled={!editor || uploading}
+          disabled={!editorReady || uploading}
           onClick={() => fileInputRef.current?.click()}
           className={`${btn} bg-gradient-to-r from-indigo-500 to-violet-500 text-white shadow-md shadow-indigo-900/50 hover:from-indigo-400 hover:to-violet-400`}
         >
           {uploading ? <Loader2 size={16} className="animate-spin" /> : <FileUp size={16} />}
           {uploading ? uploadMsg || 'Working…' : '+ Upload Math PDF'}
         </button>
-        <button id="add-solution-btn" disabled={!editor} onClick={addSolutionSpace} className={`${btn} bg-white/5 text-slate-200 hover:bg-white/10`}>
+        <button id="add-solution-btn" disabled={!editorReady} onClick={addSolutionSpace} className={`${btn} bg-white/5 text-slate-200 hover:bg-white/10`}>
           <SquarePlus size={16} /> + Add Solution Space
         </button>
-        <button id="clear-drawings-btn" disabled={!editor} onClick={clearDrawings} className={`${btn} bg-white/5 text-slate-200 hover:bg-rose-500/20 hover:text-rose-200`}>
+        <button id="clear-drawings-btn" disabled={!editorReady} onClick={clearDrawings} className={`${btn} bg-white/5 text-slate-200 hover:bg-rose-500/20 hover:text-rose-200`}>
           <Eraser size={16} /> Clear Drawings (Keep PDF)
         </button>
 
         <div className="ml-auto flex items-center gap-2">
           <button
             id="save-now-btn"
-            disabled={!editor || status === 'Saving...'}
-            onClick={() => editor && void saveNow(editor)}
+            disabled={!editorReady || status === 'Saving...'}
+            onClick={() => editorRef.current && void saveNow(editorRef.current)}
             className={`${btn} bg-emerald-500/15 text-emerald-200 ring-1 ring-emerald-400/30 hover:bg-emerald-500/25`}
           >
             <Save size={16} /> Save Now
@@ -428,9 +481,11 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
         </div>
       </header>
 
-      <main className="relative flex-1">
-        <div className="absolute inset-0">
-          <Tldraw onMount={handleMount} />
+      <main className="relative flex-1" style={{ touchAction: 'none', overflow: 'hidden' }}>
+        <div className="tl-container absolute inset-0" style={{ width: '100%', height: '100%' }}>
+          <CanvasErrorBoundary>
+            <Tldraw onMount={handleMount} />
+          </CanvasErrorBoundary>
         </div>
       </main>
     </div>

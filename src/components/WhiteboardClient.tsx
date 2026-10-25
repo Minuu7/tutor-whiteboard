@@ -23,8 +23,10 @@ import {
   Save,
   ShieldX,
   SquarePlus,
+  Trash2,
 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
+import { deleteRoomCompletely } from '@/lib/deleteRoom';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -92,6 +94,8 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
   const [uploading, setUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState('');
   const [copied, setCopied] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const deletedRef = useRef(false);
 
   const channelRef = useRef<RealtimeChannel | null>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -147,6 +151,8 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
         dirtyRef.current = true;
         return;
       }
+      // Never resurrect a room that was just deleted
+      if (deletedRef.current) return;
       savingRef.current = true;
       dirtyRef.current = false;
       updateStatusBadge('Saving...');
@@ -434,10 +440,28 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
     setTimeout(() => setCopied(false), 1800);
   }, [roomId]);
 
+  const deleteRoom = useCallback(async () => {
+    if (!confirm('Delete this classroom and all its worksheets permanently?')) return;
+    setDeleting(true);
+    deletedRef.current = true;
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    try {
+      await deleteRoomCompletely(roomId);
+      window.location.href = '/';
+    } catch (err) {
+      deletedRef.current = false;
+      setDeleting(false);
+      alert(`Delete failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [roomId]);
+
   // ---------- Render ----------
   if (gate === 'checking') {
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-slate-950 text-slate-300">
+      <div className="flex h-[100dvh] w-screen items-center justify-center bg-slate-950 text-slate-300">
         <Loader2 className="mr-3 animate-spin" /> Verifying invite link…
       </div>
     );
@@ -445,7 +469,7 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
 
   if (gate === 'denied') {
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-slate-950 p-6">
+      <div className="flex h-[100dvh] w-screen items-center justify-center bg-slate-950 p-6">
         <div className="max-w-md rounded-2xl border border-rose-500/20 bg-white/5 p-8 text-center shadow-2xl backdrop-blur">
           <ShieldX className="mx-auto mb-4 text-rose-400" size={48} />
           <h1 className="text-2xl font-bold text-white">Access Denied</h1>
@@ -464,38 +488,39 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
   }
 
   const btn =
-    'inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium transition-all duration-150 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed';
+    'inline-flex shrink-0 items-center justify-center gap-2 rounded-lg h-9 min-w-[36px] px-2 md:px-3 text-sm font-medium transition-all duration-150 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed';
+  const label = 'hidden md:inline';
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: '#020617', overflow: 'hidden' }}>
-      {/* Top Header with fixed 56px height */}
+    <div style={{ position: 'fixed', inset: 0, height: '100dvh', background: '#020617', overflow: 'hidden', overscrollBehavior: 'none' }}>
+      {/* Top Header: 48px on mobile (icon-only, horizontal scroll), 56px with full labels on md+ */}
       <header
+        className="h-12 gap-1.5 px-2 md:h-14 md:gap-2 md:px-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         style={{
           position: 'fixed',
           top: 0,
           left: 0,
           right: 0,
-          height: '56px',
           zIndex: 50,
           display: 'flex',
           alignItems: 'center',
-          gap: '8px',
-          padding: '0 12px',
           background: '#0f172a',
           borderBottom: '1px solid rgba(255,255,255,0.1)',
           overflowX: 'auto',
+          overflowY: 'hidden',
           whiteSpace: 'nowrap',
+          WebkitOverflowScrolling: 'touch',
         }}
       >
-        <a href="/" className={`${btn} text-slate-300 hover:bg-white/10`} title="Home">
+        <a href="/" className={`${btn} text-slate-300 hover:bg-white/10`} title="Home" aria-label="Home">
           <Home size={16} />
         </a>
-        <span className="rounded-full bg-indigo-500/20 px-3 py-1 font-mono text-xs text-indigo-200 ring-1 ring-indigo-400/30">
+        <span className="hidden shrink-0 rounded-full bg-indigo-500/20 px-3 py-1 font-mono text-xs text-indigo-200 ring-1 ring-indigo-400/30 sm:inline">
           Room: {roomId}
         </span>
-        <button onClick={copyInvite} className={`${btn} bg-white/5 text-slate-200 hover:bg-white/10`}>
+        <button onClick={copyInvite} title="Copy Invite Link" aria-label="Copy Invite Link" className={`${btn} bg-white/5 text-slate-200 hover:bg-white/10`}>
           {copied ? <Check size={16} className="text-emerald-400" /> : <Copy size={16} />}
-          {copied ? 'Copied!' : 'Copy Student Invite Link'}
+          <span className={label}>{copied ? 'Copied!' : 'Copy Invite Link'}</span>
         </button>
 
         <input
@@ -508,38 +533,63 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
         <button
           disabled={uploading}
           onClick={() => fileInputRef.current?.click()}
+          title="Upload Math PDF"
+          aria-label="Upload Math PDF"
           className={`${btn} bg-indigo-600 text-white hover:bg-indigo-500`}
         >
           {uploading ? <Loader2 size={16} className="animate-spin" /> : <FileUp size={16} />}
-          {uploading ? uploadMsg || 'Working…' : '+ Upload Math PDF'}
+          {uploading ? (
+            <span className="max-w-[120px] truncate text-xs md:max-w-none md:text-sm">{uploadMsg || 'Working…'}</span>
+          ) : (
+            <span className={label}>+ Upload Math PDF</span>
+          )}
         </button>
         <button
           onClick={addSolutionSpace}
+          title="Add Solution Space"
+          aria-label="Add Solution Space"
           className={`${btn} bg-white/5 text-slate-200 hover:bg-white/10`}
         >
-          <SquarePlus size={16} /> + Add Solution Space
+          <SquarePlus size={16} /> <span className={label}>+ Add Solution Space</span>
         </button>
         <button
           onClick={clearDrawings}
+          title="Clear"
+          aria-label="Clear drawings"
           className={`${btn} bg-white/5 text-slate-200 hover:bg-rose-500/20 hover:text-rose-200`}
         >
-          <Eraser size={16} /> Clear Drawings
+          <Eraser size={16} /> <span className={label}>Clear</span>
         </button>
 
-        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div className="gap-1.5 md:gap-2" style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', flexShrink: 0 }}>
           <button
             onClick={() => editorRef.current && void saveNow(editorRef.current)}
+            title="Save Now"
+            aria-label="Save Now"
             className={`${btn} bg-emerald-500/15 text-emerald-200 ring-1 ring-emerald-400/30 hover:bg-emerald-500/25`}
           >
-            <Save size={16} /> Save Now
+            <Save size={16} /> <span className={label}>Save Now</span>
+          </button>
+          <button
+            onClick={deleteRoom}
+            disabled={deleting}
+            title="Delete Room"
+            aria-label="Delete Room"
+            className={`${btn} bg-rose-500/15 text-rose-300 ring-1 ring-rose-400/30 hover:bg-rose-500 hover:text-white`}
+          >
+            {deleting ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
+            <span className={label}>Delete Room</span>
           </button>
           <span
             ref={statusBadgeRef}
+            className="px-2 md:px-3"
             style={{
-              padding: '4px 12px',
+              paddingTop: '4px',
+              paddingBottom: '4px',
               borderRadius: '9999px',
               fontSize: '12px',
               fontWeight: 600,
+              flexShrink: 0,
               background: 'rgba(16, 185, 129, 0.2)',
               color: '#6ee7b7',
             }}
@@ -549,18 +599,19 @@ export default function WhiteboardClient({ roomId }: { roomId: string }) {
         </div>
       </header>
 
-      {/* Fixed Canvas Container that can NEVER collapse to 0px or black */}
+      {/* Fixed Canvas Container — dvh so mobile address bars never hide the Tldraw toolbar */}
       <div
+        className="top-12 h-[calc(100dvh-48px)] md:top-14 md:h-[calc(100dvh-56px)]"
         style={{
           position: 'fixed',
-          top: '56px',
           left: 0,
           right: 0,
           bottom: 0,
-          width: '100vw',
-          height: 'calc(100vh - 56px)',
+          width: '100%',
           background: '#ffffff',
           zIndex: 1,
+          touchAction: 'none',
+          overscrollBehavior: 'none',
         }}
       >
         <MemoizedTldraw onMount={handleMount} />
